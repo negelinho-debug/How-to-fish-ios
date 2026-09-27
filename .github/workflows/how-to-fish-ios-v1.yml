@@ -1,4 +1,4 @@
-name: How to Fish iOS - v1 IPA
+name: How to Fish iOS - v2 IPA
 
 on:
   workflow_dispatch:
@@ -361,6 +361,24 @@ jobs:
           echo "===== BUILD SCRIPT CREATED ====="
           sed -n '1,260p' "$PROJECT/Assets/Editor/HowToFishIOSBuild.cs"
 
+      - name: Record AssetRipper plugin DLLs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.locate.outputs.project }}"
+
+          echo "===== ASSETRIPPER DLLS =====" | tee output/assetripper-plugin-dlls.txt
+          find "$PROJECT/Assets" -type f -name '*.dll' -printf '%p  %s bytes\n' \
+            | sort \
+            | tee -a output/assetripper-plugin-dlls.txt
+
+          echo
+          echo "v2 FIX:"
+          echo "Unity API/Assembly Updater will be disabled during import."
+          echo "The v1 failure was inside ApiUpdater/MovedFromExtractor on"
+          echo "Assets/Plugins/Unity.RenderPipelines.Universal.Runtime.dll."
+
       - name: Check Unity secrets
         shell: bash
         run: |
@@ -676,8 +694,9 @@ jobs:
             -nographics \
             -quit \
             -projectPath "$PROJECT" \
+            -buildTarget iOS \
+            -disable-assembly-updater \
             -executeMethod HowToFishIOSBuild.PerformBuild \
-            -accept-apiupdate \
             -logFile "$LOG"
 
           RC=$?
@@ -727,6 +746,9 @@ jobs:
           cp output/platform-references.txt \
             unity-build-diagnostics/ 2>/dev/null || true
 
+          cp output/assetripper-plugin-dlls.txt \
+            unity-build-diagnostics/ 2>/dev/null || true
+
           cp output/scenes.txt \
             unity-build-diagnostics/ 2>/dev/null || true
 
@@ -742,7 +764,7 @@ jobs:
           } > unity-build-diagnostics/summary.txt
 
           grep -RniE \
-            'error CS[0-9]+|Compilation failed|compiler error|Exception|error:|failed|FAILURE|DllNotFoundException|MissingReferenceException|TypeLoadException|Assertion|SIGABRT|crash' \
+            'error CS[0-9]+|Compilation failed|compiler error|Exception|error:|failed|FAILURE|DllNotFoundException|MissingReferenceException|TypeLoadException|Assertion|SIGABRT|crash|ApiUpdater|MovedFromExtractor|NotImplementedException|NullReferenceException' \
             unity-build-diagnostics \
             > unity-build-diagnostics/important-errors.txt \
             2>/dev/null || true
@@ -754,7 +776,7 @@ jobs:
         if: steps.detect_xcode.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-v1
+          name: How-to-Fish-iOS-Xcode-v2
           path: build/iOS/HowToFish-iOS
           if-no-files-found: error
           compression-level: 0
@@ -763,7 +785,7 @@ jobs:
         if: always() && steps.detect_xcode.outputs.ready != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Unity-Diagnostics-v1
+          name: How-to-Fish-iOS-Unity-Diagnostics-v2
           path: unity-build-diagnostics
           if-no-files-found: warn
           compression-level: 0
@@ -773,7 +795,7 @@ jobs:
         shell: bash
         run: |
           echo "Unity did not generate an iOS Xcode project."
-          echo "Download: How-to-Fish-iOS-Unity-Diagnostics-v1"
+          echo "Download: How-to-Fish-iOS-Unity-Diagnostics-v2"
           exit 1
 
   make_ipa:
@@ -787,7 +809,7 @@ jobs:
       - name: Download Unity Xcode project
         uses: actions/download-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-v1
+          name: How-to-Fish-iOS-Xcode-v2
           path: unity-ios
 
       - name: Inspect Xcode project
@@ -929,17 +951,17 @@ jobs:
             --sequesterRsrc \
             --keepParent \
             Payload \
-            "How-to-Fish-iOS-v1-unsigned.ipa"
+            "How-to-Fish-iOS-v2-unsigned.ipa"
 
           echo "===== IPA ====="
-          ls -lh "How-to-Fish-iOS-v1-unsigned.ipa"
+          ls -lh "How-to-Fish-iOS-v2-unsigned.ipa"
 
       - name: Upload IPA
         if: steps.app.outputs.found == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-v1-IPA
-          path: How-to-Fish-iOS-v1-unsigned.ipa
+          name: How-to-Fish-iOS-v2-IPA
+          path: How-to-Fish-iOS-v2-unsigned.ipa
           if-no-files-found: error
           compression-level: 0
 
@@ -970,7 +992,7 @@ jobs:
         if: always() && steps.app.outputs.found != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-Diagnostics-v1
+          name: How-to-Fish-iOS-Xcode-Diagnostics-v2
           path: xcode-diagnostics
           if-no-files-found: warn
           compression-level: 0
@@ -981,9 +1003,9 @@ jobs:
         run: |
           if [ "${{ steps.app.outputs.found }}" != "true" ]; then
             echo "IPA was not created."
-            echo "Download: How-to-Fish-iOS-Xcode-Diagnostics-v1"
+            echo "Download: How-to-Fish-iOS-Xcode-Diagnostics-v2"
             exit 1
           fi
 
-          echo "SUCCESS: How-to-Fish-iOS-v1-unsigned.ipa"
-          echo "Artifact: How-to-Fish-iOS-v1-IPA"
+          echo "SUCCESS: How-to-Fish-iOS-v2-unsigned.ipa"
+          echo "Artifact: How-to-Fish-iOS-v2-IPA"
