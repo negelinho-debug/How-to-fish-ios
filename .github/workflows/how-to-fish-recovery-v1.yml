@@ -1,0 +1,425 @@
+name: How to Fish - Recovery v1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    name: Recover How to Fish Unity project
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare
+        run: |
+          set -euo pipefail
+          rm -rf work tools recovered diagnostics release-files
+          mkdir -p work tools recovered diagnostics release-files
+
+          for cmd in gh unzip curl tar xz strings python3; do
+            command -v "$cmd" >/dev/null || {
+              echo "ERROR: missing tool: $cmd"
+              exit 1
+            }
+          done
+
+      - name: Download largest APK from newest Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TAG="$(gh release list --limit 1 --json tagName --jq '.[0].tagName')"
+
+          if [ -z "$TAG" ]; then
+            echo "ERROR: no GitHub Release found."
+            exit 1
+          fi
+
+          echo "Release: $TAG"
+
+          gh release download "$TAG" \
+            --dir release-files \
+            --pattern "*.apk"
+
+          APK="$(
+            find release-files -type f -iname '*.apk' -printf '%s %p\n' \
+              | sort -nr \
+              | head -1 \
+              | cut -d' ' -f2-
+          )"
+
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "ERROR: no APK asset in newest Release."
+            exit 1
+          fi
+
+          cp "$APK" work/HowToFish.apk
+          echo "APK=$APK" | tee diagnostics/apk.txt
+          ls -lh work/HowToFish.apk | tee -a diagnostics/apk.txt
+
+      - name: Extract APK
+        run: |
+          set -euo pipefail
+          mkdir -p work/apk
+          unzip -oq work/HowToFish.apk -d work/apk
+
+          find work/apk -maxdepth 4 -type f -printf '%p  %s bytes\n' \
+            | sort \
+            | head -3000 \
+            > diagnostics/apk-tree.txt
+
+      - name: Verify IL2CPP inputs
+        id: inputs
+        run: |
+          set -euo pipefail
+
+          DATA_DIR="work/apk/assets/bin/Data"
+          IL2CPP="$(find work/apk -type f -path '*/arm64-v8a/libil2cpp.so' -print | head -1)"
+          UNITY="$(find work/apk -type f -path '*/arm64-v8a/libunity.so' -print | head -1)"
+          META="$(find work/apk -type f -name global-metadata.dat -print | head -1)"
+
+          {
+            echo "DATA_DIR=$DATA_DIR"
+            echo "LIBUNITY=$UNITY"
+            echo "LIBIL2CPP=$IL2CPP"
+            echo "GLOBAL_METADATA=$META"
+          } | tee diagnostics/il2cpp-inputs.txt
+
+          test -d "$DATA_DIR"
+          test -s "$IL2CPP"
+          test -s "$UNITY"
+          test -s "$META"
+
+          echo "data_dir=$DATA_DIR" >> "$GITHUB_OUTPUT"
+          echo "il2cpp=$IL2CPP" >> "$GITHUB_OUTPUT"
+          echo "metadata=$META" >> "$GITHUB_OUTPUT"
+
+      - name: Read real UnityFS version headers
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY' | tee diagnostics/unityfs-headers.txt
+          from pathlib import Path
+          import struct, re
+
+          roots = [
+              Path("work/apk/assets/bin/Data/data.unity3d"),
+              Path("work/apk/assets/bin/Data/datapack.unity3d"),
+          ]
+
+          def read_cstr(data, pos):
+              end = data.find(b"\0", pos)
+              if end < 0:
+                  return None, len(data)
+              return data[pos:end].decode("utf-8", "replace"), end + 1
+
+          found = []
+          for p in roots:
+              print(f"===== {p} =====")
+              if not p.exists():
+                  print("MISSING")
+                  continue
+
+              data = p.read_bytes()[:1024]
+              print("first64_hex:", data[:64].hex())
+
+              if data.startswith(b"UnityFS\0"):
+                  pos = len(b"UnityFS\0")
+                  if len(data) >= pos + 4:
+                      fmt = struct.unpack(">I", data[pos:pos+4])[0]
+                      pos += 4
+                      unity_version, pos = read_cstr(data, pos)
+                      unity_revision, pos = read_cstr(data, pos)
+                      print("format:", fmt)
+                      print("unity_version_field:", unity_version)
+                      print("unity_revision_field:", unity_revision)
+                      for v in (unity_version, unity_revision):
+                          if v:
+                              found.append(v)
+              else:
+                  print("Not a UnityFS header at offset 0")
+
+              text = data.decode("latin1", "ignore")
+              for m in re.findall(r"(?:20\d{2}|6000)\.\d+\.\d+[abfp]\d+", text):
+                  found.append(m)
+
+          print("===== HEADER VERSION CANDIDATES =====")
+          for v in dict.fromkeys(found):
+              print(v)
+          PY
+
+      - name: Scan native Unity version strings
+        run: |
+          set +e
+
+          UNITY="${{ steps.inputs.outputs.il2cpp }}"
+          UNITYLIB="$(find work/apk -type f -path '*/arm64-v8a/libunity.so' -print | head -1)"
+
+          echo "===== LIBUNITY VERSION STRINGS =====" \
+            | tee diagnostics/libunity-version-strings.txt
+
+          strings "$UNITYLIB" 2>/dev/null \
+            | grep -Eo '(20[0-9]{2}|6000)\.[0-9]+\.[0-9]+[abfp][0-9]+' \
+            | sort -Vu \
+            | tee -a diagnostics/libunity-version-strings.txt || true
+
+      - name: Record package and runtime metadata
+        run: |
+          set +e
+
+          cp work/apk/assets/bin/Data/ScriptingAssemblies.json \
+            diagnostics/ScriptingAssemblies.json 2>/dev/null || true
+
+          cp work/apk/assets/bin/Data/RuntimeInitializeOnLoads.json \
+            diagnostics/RuntimeInitializeOnLoads.json 2>/dev/null || true
+
+          cp work/apk/assets/bin/Data/boot.config \
+            diagnostics/boot.config 2>/dev/null || true
+
+          echo "===== UNITYFS FILES =====" > diagnostics/unityfs-files.txt
+          find work/apk -type f \( -name '*.unity3d' -o -name '*.bundle' \) \
+            -printf '%p  %s bytes\n' \
+            | sort \
+            >> diagnostics/unityfs-files.txt
+
+          echo "===== NATIVE LIBS =====" > diagnostics/native-libs.txt
+          find work/apk/lib -type f -name '*.so' -printf '%p  %s bytes\n' \
+            | sort \
+            >> diagnostics/native-libs.txt
+
+      - name: Download AssetRipper 2.0.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          gh api repos/AssetRipper/AssetRipper/releases/tags/2.0.0 \
+            --jq '.assets[].name' \
+            | tee diagnostics/assetripper-assets.txt
+
+          ASSET="$(
+            grep -E '^AssetRipper_linux_x64\.tar\.xz$' \
+              diagnostics/assetripper-assets.txt \
+              | head -1
+          )"
+
+          if [ -z "$ASSET" ]; then
+            ASSET="$(
+              grep -Ei 'AssetRipper.*linux.*x64.*\.(tar\.xz|zip)$' \
+                diagnostics/assetripper-assets.txt \
+                | head -1
+            )"
+          fi
+
+          if [ -z "$ASSET" ]; then
+            echo "ERROR: Linux x64 AssetRipper asset not found."
+            exit 1
+          fi
+
+          gh release download 2.0.0 \
+            -R AssetRipper/AssetRipper \
+            -p "$ASSET" \
+            -D tools
+
+          mkdir -p tools/assetripper
+
+          case "tools/$ASSET" in
+            *.tar.xz)
+              tar -xJf "tools/$ASSET" -C tools/assetripper
+              ;;
+            *.zip)
+              unzip -q "tools/$ASSET" -d tools/assetripper
+              ;;
+            *)
+              echo "ERROR: unsupported AssetRipper archive."
+              exit 1
+              ;;
+          esac
+
+          RIPPER="$(
+            find tools/assetripper -type f \
+              \( -name 'AssetRipper.GUI.Free' \
+                 -o -name 'AssetRipper.GUI' \
+                 -o -name 'AssetRipper' \) \
+              | head -1
+          )"
+
+          if [ -z "$RIPPER" ]; then
+            echo "ERROR: AssetRipper executable not found."
+            find tools/assetripper -maxdepth 4 -type f | head -300
+            exit 1
+          fi
+
+          chmod +x "$RIPPER"
+          echo "$RIPPER" > diagnostics/assetripper-path.txt
+          "$RIPPER" --help > diagnostics/assetripper-help.txt 2>&1 || true
+
+      - name: Recover project with AssetRipper
+        id: recover
+        continue-on-error: true
+        run: |
+          set +e
+
+          RIPPER="$(cat diagnostics/assetripper-path.txt)"
+          PORT=3333
+          INPUT="$PWD/work/apk"
+          OUTPUT="$PWD/recovered/HowToFish"
+
+          mkdir -p "$OUTPUT"
+
+          "$RIPPER" \
+            --headless \
+            --port "$PORT" \
+            > diagnostics/assetripper.log 2>&1 &
+
+          PID=$!
+          echo "$PID" > diagnostics/assetripper.pid
+
+          READY=0
+          for i in $(seq 1 120); do
+            if curl -fsS "http://127.0.0.1:${PORT}/" >/dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "ERROR: AssetRipper web service did not start."
+            tail -300 diagnostics/assetripper.log || true
+            kill "$PID" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "===== LOAD APK ROOT ====="
+          LOAD_CODE="$(
+            curl -sS \
+              -o diagnostics/load-response.txt \
+              -w '%{http_code}' \
+              -H 'Content-Type: application/x-www-form-urlencoded' \
+              --data-urlencode "Path=$INPUT" \
+              "http://127.0.0.1:${PORT}/LoadFolder"
+          )"
+
+          echo "LOAD_HTTP=$LOAD_CODE" | tee diagnostics/load-status.txt
+
+          if [ "$LOAD_CODE" != "200" ] && [ "$LOAD_CODE" != "302" ]; then
+            echo "ERROR: AssetRipper LoadFolder failed."
+            cat diagnostics/load-response.txt || true
+            tail -400 diagnostics/assetripper.log || true
+            kill "$PID" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "===== EXPORT UNITY PROJECT ====="
+          EXPORT_CODE="$(
+            curl -sS \
+              -o diagnostics/export-response.txt \
+              -w '%{http_code}' \
+              -H 'Content-Type: application/x-www-form-urlencoded' \
+              --data-urlencode "Path=$OUTPUT" \
+              --data-urlencode 'CreateSubfolder=false' \
+              "http://127.0.0.1:${PORT}/Export/UnityProject"
+          )"
+
+          echo "EXPORT_HTTP=$EXPORT_CODE" | tee diagnostics/export-status.txt
+
+          kill "$PID" 2>/dev/null || true
+          wait "$PID" 2>/dev/null || true
+
+          if [ "$EXPORT_CODE" != "200" ] && [ "$EXPORT_CODE" != "302" ]; then
+            echo "ERROR: AssetRipper export failed."
+            cat diagnostics/export-response.txt || true
+            tail -500 diagnostics/assetripper.log || true
+            exit 1
+          fi
+
+          PROJECT=""
+          if [ -d "$OUTPUT/ExportedProject/Assets" ]; then
+            PROJECT="$OUTPUT/ExportedProject"
+          elif [ -d "$OUTPUT/Assets" ]; then
+            PROJECT="$OUTPUT"
+          fi
+
+          if [ -z "$PROJECT" ]; then
+            echo "ERROR: export returned success but no Unity Assets directory was found."
+            find "$OUTPUT" -maxdepth 4 -type d | head -300
+            exit 1
+          fi
+
+          echo "$PROJECT" > diagnostics/recovered-project-path.txt
+
+          {
+            echo "RECOVERED_PROJECT=$PROJECT"
+            echo "SCENES=$(find "$PROJECT/Assets" -type f -name '*.unity' | wc -l)"
+            echo "CS_FILES=$(find "$PROJECT/Assets" -type f -name '*.cs' | wc -l)"
+            echo "DLLS=$(find "$PROJECT/Assets" -type f -name '*.dll' | wc -l)"
+            echo "PROJECT_VERSION:"
+            cat "$PROJECT/ProjectSettings/ProjectVersion.txt" 2>/dev/null || true
+          } | tee diagnostics/recovery-summary.txt
+
+          find "$PROJECT/Assets" -type f -name '*.unity' \
+            | head -200 \
+            > diagnostics/recovered-scenes.txt
+
+          exit 0
+
+      - name: Collect important AssetRipper lines
+        if: always()
+        run: |
+          set +e
+
+          grep -niE \
+            'Unity version|IL2Cpp|IL2CPP|metadata|dummy|assembly|Cpp2IL|error|exception|failed|unsupported|warning|script' \
+            diagnostics/assetripper.log \
+            | tail -800 \
+            > diagnostics/important-assetripper-lines.txt \
+            || true
+
+          echo "===== IMPORTANT ASSETRIPPER LINES ====="
+          tail -300 diagnostics/important-assetripper-lines.txt || true
+
+      - name: Upload recovery diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: How-to-Fish-Recovery-Diagnostics-v1
+          path: diagnostics
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: Upload recovered Unity project
+        if: steps.recover.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: How-to-Fish-Recovered-Unity-Project-v1
+          path: recovered
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Final status
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "HOW TO FISH RECOVERY v1"
+          echo "Recovery outcome: ${{ steps.recover.outcome }}"
+          echo "=========================================="
+
+          cat diagnostics/recovery-summary.txt 2>/dev/null || true
+          echo
+
+          if [ "${{ steps.recover.outcome }}" != "success" ]; then
+            echo "Recovery did not finish."
+            echo "Download artifact: How-to-Fish-Recovery-Diagnostics-v1"
+            exit 1
+          fi
+
+          echo "Recovery succeeded."
+          echo "Download artifact: How-to-Fish-Recovered-Unity-Project-v1"
