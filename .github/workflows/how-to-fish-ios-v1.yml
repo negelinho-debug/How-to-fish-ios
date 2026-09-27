@@ -1,0 +1,989 @@
+name: How to Fish iOS - v1 IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build_unity_ios:
+    name: 1. Build How to Fish iOS Xcode
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    env:
+      UNITY_USERNAME: ${{ secrets.UNITY_USERNAME }}
+      UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+      UNITY_EMAIL: ${{ secrets.UNITY_USERNAME }}
+
+    outputs:
+      xcode_ready: ${{ steps.detect_xcode.outputs.ready }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare folders
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf recovered-project build tools output unity-build-diagnostics
+          mkdir -p recovered-project build tools output unity-build-diagnostics
+
+      - name: Download latest successful recovered Unity project
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "===== FIND LATEST SUCCESSFUL RECOVERY RUN ====="
+
+          RUN_ID="$(
+            gh run list \
+              --workflow how-to-fish-recovery-v1.yml \
+              --status success \
+              --limit 10 \
+              --json databaseId,conclusion,createdAt \
+              --jq '.[0].databaseId'
+          )"
+
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "ERROR: no successful how-to-fish-recovery-v1.yml run found."
+            exit 1
+          fi
+
+          echo "RECOVERY_RUN_ID=$RUN_ID"
+
+          gh run download "$RUN_ID" \
+            --name "How-to-Fish-Recovered-Unity-Project-v1" \
+            --dir recovered-project
+
+          echo "===== DOWNLOADED RECOVERED PROJECT ====="
+          find recovered-project -maxdepth 4 -type d | head -200
+
+      - name: Locate recovered Unity project
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="$(
+            find recovered-project \
+              -type f \
+              -path '*/ProjectSettings/ProjectVersion.txt' \
+              -print \
+              | head -1 \
+              | sed 's#/ProjectSettings/ProjectVersion.txt$##'
+          )"
+
+          if [ -z "$PROJECT" ] || [ ! -d "$PROJECT/Assets" ]; then
+            echo "ERROR: recovered Unity project not found."
+            find recovered-project -maxdepth 6 -type f | head -300
+            exit 1
+          fi
+
+          PROJECT="$(realpath "$PROJECT")"
+
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+          echo "PROJECT=$PROJECT" >> "$GITHUB_ENV"
+
+          echo "===== PROJECT VERSION ====="
+          cat "$PROJECT/ProjectSettings/ProjectVersion.txt"
+
+          VERSION="$(
+            sed -n 's/^m_EditorVersion:[[:space:]]*//p' \
+              "$PROJECT/ProjectSettings/ProjectVersion.txt" \
+              | head -1 \
+              | tr -d '\r'
+          )"
+
+          if [ "$VERSION" != "6000.4.4f1" ]; then
+            echo "ERROR: expected Unity 6000.4.4f1, got: $VERSION"
+            exit 1
+          fi
+
+          echo "unity_version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare recovered project for iOS
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.locate.outputs.project }}"
+
+          echo "===== REMOVE ANDROID-ONLY NATIVE FILES ====="
+          find "$PROJECT/Assets" -type f \
+            \( -iname '*.so' -o -iname '*.aar' -o -iname '*.jar' -o -iname '*.apk' \) \
+            -print \
+            | tee output/removed-android-native-files.txt || true
+
+          find "$PROJECT/Assets" -type f \
+            \( -iname '*.so' -o -iname '*.aar' -o -iname '*.jar' -o -iname '*.apk' \) \
+            -delete || true
+
+          rm -rf "$PROJECT/Assets/Plugins/Android" || true
+
+          echo "===== RECOVERED SCENES ====="
+          find "$PROJECT/Assets" -type f -name '*.unity' \
+            | sort \
+            | tee output/scenes.txt
+
+          echo "===== C# FILE COUNT ====="
+          find "$PROJECT/Assets" -type f -name '*.cs' | wc -l \
+            | tee output/csharp-count.txt
+
+          echo "===== NATIVE/ONLINE REFERENCES ====="
+          grep -RniE \
+            'GoogleMobileAds|AndroidJava|UNITY_ANDROID|Epic\.OnlineServices|EOS|Steamworks|FishNet' \
+            "$PROJECT/Assets" \
+            --include='*.cs' \
+            | head -1000 \
+            | tee output/platform-references.txt || true
+
+          mkdir -p "$PROJECT/Assets/HowToFishIOS"
+          mkdir -p "$PROJECT/Assets/Editor"
+
+          cat > "$PROJECT/Assets/HowToFishIOS/HowToFishIOSRuntimeLogger.cs" <<'CS'
+          using System;
+          using System.IO;
+          using UnityEngine;
+          using UnityEngine.SceneManagement;
+
+          public sealed class HowToFishIOSRuntimeLogger : MonoBehaviour
+          {
+              private static HowToFishIOSRuntimeLogger instance;
+              private static readonly object Gate = new object();
+              private static string logDir;
+              private static string logFile;
+
+              [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+              private static void Bootstrap()
+              {
+                  if (instance != null)
+                      return;
+
+                  GameObject go = new GameObject("HowToFishIOSRuntimeLogger");
+                  DontDestroyOnLoad(go);
+                  instance = go.AddComponent<HowToFishIOSRuntimeLogger>();
+              }
+
+              private void Awake()
+              {
+                  try
+                  {
+                      logDir = Path.Combine(Application.persistentDataPath, "Logs");
+                      Directory.CreateDirectory(logDir);
+                      logFile = Path.Combine(logDir, "runtime.log");
+
+                      File.WriteAllText(
+                          logFile,
+                          "HOW TO FISH iOS RUNTIME LOG\n" +
+                          "Time: " + DateTime.Now.ToString("O") + "\n" +
+                          "Unity: " + Application.unityVersion + "\n" +
+                          "Platform: " + Application.platform + "\n" +
+                          "Device: " + SystemInfo.deviceModel + "\n" +
+                          "OS: " + SystemInfo.operatingSystem + "\n" +
+                          "Graphics: " + SystemInfo.graphicsDeviceName + "\n\n"
+                      );
+                  }
+                  catch { }
+
+                  Application.logMessageReceived += OnLog;
+                  SceneManager.sceneLoaded += OnSceneLoaded;
+
+                  Write("LOGGER READY");
+                  Write("persistentDataPath=" + Application.persistentDataPath);
+              }
+
+              private void OnDestroy()
+              {
+                  Application.logMessageReceived -= OnLog;
+                  SceneManager.sceneLoaded -= OnSceneLoaded;
+              }
+
+              private static void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+              {
+                  Write("SCENE LOADED: " + scene.name + " / " + scene.path + " / " + mode);
+              }
+
+              private static void OnLog(string condition, string stackTrace, LogType type)
+              {
+                  Write("[" + type + "] " + condition +
+                        (string.IsNullOrEmpty(stackTrace) ? "" : "\n" + stackTrace));
+              }
+
+              private static void Write(string text)
+              {
+                  try
+                  {
+                      if (string.IsNullOrEmpty(logFile))
+                          return;
+
+                      lock (Gate)
+                      {
+                          File.AppendAllText(
+                              logFile,
+                              DateTime.Now.ToString("HH:mm:ss.fff") + " " + text + "\n"
+                          );
+                      }
+                  }
+                  catch { }
+              }
+          }
+          CS
+
+          cat > "$PROJECT/Assets/Editor/HowToFishIOSBuild.cs" <<'CS'
+          using System;
+          using System.Collections.Generic;
+          using System.IO;
+          using System.Linq;
+          using UnityEditor;
+          using UnityEditor.Build;
+          using UnityEditor.Build.Reporting;
+          using UnityEngine;
+
+          public static class HowToFishIOSBuild
+          {
+              public static void PerformBuild()
+              {
+                  string preferredMain = "Assets/Scenes/Game.unity";
+
+                  List<string> scenes = AssetDatabase
+                      .FindAssets("t:Scene", new[] { "Assets" })
+                      .Select(AssetDatabase.GUIDToAssetPath)
+                      .Where(IsValidScene)
+                      .Distinct()
+                      .OrderBy(p => p)
+                      .ToList();
+
+                  if (scenes.Contains(preferredMain))
+                  {
+                      scenes.Remove(preferredMain);
+                      scenes.Insert(0, preferredMain);
+                  }
+
+                  if (scenes.Count == 0)
+                      throw new Exception("No valid Unity scenes were recovered.");
+
+                  Debug.Log("HOW TO FISH iOS SCENES (" + scenes.Count + "):");
+                  foreach (string scene in scenes)
+                      Debug.Log("  " + scene);
+
+                  EditorBuildSettings.scenes = scenes
+                      .Select(p => new EditorBuildSettingsScene(p, true))
+                      .ToArray();
+
+                  string output = Environment.GetEnvironmentVariable("HTF_IOS_XCODE_PATH");
+                  if (string.IsNullOrWhiteSpace(output))
+                  {
+                      output = Path.GetFullPath(
+                          Path.Combine(
+                              Application.dataPath,
+                              "../../build/iOS/HowToFish-iOS"
+                          )
+                      );
+                  }
+
+                  Directory.CreateDirectory(output);
+
+                  PlayerSettings.productName = "How to Fish";
+                  PlayerSettings.companyName = "HowToFishIOSPort";
+                  PlayerSettings.bundleVersion = "1.0.2";
+
+                  PlayerSettings.SetApplicationIdentifier(
+                      NamedBuildTarget.iOS,
+                      "com.howtofish.ios.port"
+                  );
+
+                  PlayerSettings.SetScriptingBackend(
+                      NamedBuildTarget.iOS,
+                      ScriptingImplementation.IL2CPP
+                  );
+
+                  PlayerSettings.iOS.sdkVersion = iOSSdkVersion.DeviceSDK;
+                  PlayerSettings.iOS.targetOSVersionString = "15.0";
+                  PlayerSettings.stripEngineCode = false;
+                  PlayerSettings.statusBarHidden = true;
+
+                  BuildPlayerOptions options = new BuildPlayerOptions
+                  {
+                      scenes = scenes.ToArray(),
+                      locationPathName = output,
+                      target = BuildTarget.iOS,
+                      options = BuildOptions.CleanBuildCache
+                  };
+
+                  Debug.Log("HOW TO FISH iOS OUTPUT: " + output);
+
+                  BuildReport report = BuildPipeline.BuildPlayer(options);
+
+                  Debug.Log("HOW TO FISH iOS RESULT: " + report.summary.result);
+                  Debug.Log("HOW TO FISH iOS ERRORS: " + report.summary.totalErrors);
+                  Debug.Log("HOW TO FISH iOS WARNINGS: " + report.summary.totalWarnings);
+
+                  if (report.summary.result != BuildResult.Succeeded)
+                  {
+                      throw new Exception(
+                          "How to Fish iOS build failed: " +
+                          report.summary.result +
+                          ", errors=" + report.summary.totalErrors
+                      );
+                  }
+              }
+
+              private static bool IsValidScene(string path)
+              {
+                  if (string.IsNullOrWhiteSpace(path))
+                      return false;
+
+                  string normalized = path.Replace('\\', '/');
+
+                  if (!normalized.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                      return false;
+
+                  SceneAsset sceneAsset =
+                      AssetDatabase.LoadAssetAtPath<SceneAsset>(normalized);
+
+                  if (sceneAsset != null)
+                      return true;
+
+                  string projectRoot =
+                      Directory.GetParent(Application.dataPath).FullName;
+
+                  return File.Exists(Path.Combine(projectRoot, normalized));
+              }
+          }
+          CS
+
+          echo "===== BUILD SCRIPT CREATED ====="
+          sed -n '1,260p' "$PROJECT/Assets/Editor/HowToFishIOSBuild.cs"
+
+      - name: Check Unity secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${UNITY_USERNAME:-}" ]; then
+            echo "ERROR: UNITY_USERNAME secret is missing."
+            exit 1
+          fi
+
+          if [ -z "${UNITY_PASSWORD:-}" ]; then
+            echo "ERROR: UNITY_PASSWORD secret is missing."
+            exit 1
+          fi
+
+          echo "Unity login secrets are present."
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Unity Hub and helper CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npm install -g @rage-against-the-pixel/unity-cli
+
+          sudo apt-get update -o Acquire::Retries=4 || true
+          sudo apt-get install -y \
+            ca-certificates \
+            curl \
+            gnupg \
+            xvfb \
+            libgbm1 \
+            libgtk-3-0 \
+            libnss3
+
+          sudo install -d -m 0755 /etc/apt/keyrings
+
+          curl -fsSL https://hub.unity3d.com/linux/keys/public \
+            | sudo gpg --dearmor \
+              -o /etc/apt/keyrings/unityhub.gpg
+
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/unityhub.gpg] https://hub.unity3d.com/linux/repos/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/unityhub.list >/dev/null
+
+          sudo apt-get update -o Acquire::Retries=4 || true
+          sudo apt-get install -y unityhub
+
+          HUB_CMD="$(command -v unityhub || true)"
+          if [ -z "$HUB_CMD" ]; then
+            echo "ERROR: unityhub command not found."
+            exit 1
+          fi
+
+          sudo mkdir -p /opt/unityhub
+
+          sudo tee /opt/unityhub/unityhub >/dev/null <<EOF
+          #!/bin/bash
+          exec xvfb-run -a "$HUB_CMD" --no-sandbox --headless "\$@"
+          EOF
+
+          sudo chmod +x /opt/unityhub/unityhub
+
+          echo "UNITY_HUB_PATH=/opt/unityhub/unityhub" >> "$GITHUB_ENV"
+          echo "/opt/unityhub" >> "$GITHUB_PATH"
+
+      - name: Install official Unity CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export UNITY_CLI_HOME="$PWD/tools/unity-official-cli"
+          export UNITY_CLI_CHANNEL="beta"
+          export UNITY_NON_INTERACTIVE=1
+          export UNITY_NO_CONSENT_PROMPT=1
+          export UNITY_NO_UPDATE_CHECK=1
+
+          rm -rf "$UNITY_CLI_HOME"
+          mkdir -p "$UNITY_CLI_HOME"
+
+          curl -fsSL --retry 5 --retry-delay 3 \
+            https://public-cdn.cloud.unity3d.com/hub/prod/cli/install.sh \
+            -o /tmp/unity-cli-install.sh
+
+          bash /tmp/unity-cli-install.sh
+
+          UNITY="$UNITY_CLI_HOME/bin/unity"
+          test -x "$UNITY"
+
+          echo "OFFICIAL_UNITY_CLI=$UNITY" >> "$GITHUB_ENV"
+          "$UNITY" --version
+
+      - name: Install Unity 6000.4.4f1 + iOS module
+        id: unity_setup
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UNITY="$OFFICIAL_UNITY_CLI"
+          VERSION="6000.4.4f1"
+          CHANGESET="360f97ecca93"
+          INSTALL_ROOT="$HOME/UnityEditors"
+
+          export UNITY_NON_INTERACTIVE=1
+          export UNITY_NO_CONSENT_PROMPT=1
+          export UNITY_NO_UPDATE_CHECK=1
+          export UNITY_INSTALL_RETRIES=3
+
+          mkdir -p "$INSTALL_ROOT"
+
+          "$UNITY" --non-interactive --no-banner --no-color \
+            editors install-path --set "$INSTALL_ROOT"
+
+          echo "===== INSTALL UNITY $VERSION + iOS ====="
+
+          set +e
+          timeout 70m "$UNITY" --non-interactive --no-banner --no-color \
+            install "$VERSION" \
+            --changeset "$CHANGESET" \
+            --module ios \
+            --no-child-modules \
+            --yes \
+            --accept-eula \
+            2>&1 | tee output/unity-install.log
+          RC=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$RC" -eq 124 ]; then
+            echo "ERROR: Unity install exceeded 70 minutes."
+            exit 1
+          elif [ "$RC" -ne 0 ]; then
+            echo "ERROR: Unity install failed with code $RC."
+            exit "$RC"
+          fi
+
+          echo "===== FIND UNITY EDITOR ====="
+
+          EDITOR="$(
+            find "$INSTALL_ROOT" \
+              -type f \
+              -path '*/Editor/Unity' \
+              -perm -111 \
+              -print \
+              | head -1
+          )"
+
+          if [ -z "$EDITOR" ]; then
+            echo "ERROR: Unity Editor executable not found."
+            find "$INSTALL_ROOT" -maxdepth 5 -type f | head -400
+            exit 1
+          fi
+
+          echo "EDITOR=$EDITOR"
+          echo "editor=$EDITOR" >> "$GITHUB_OUTPUT"
+          echo "UNITY_EDITOR=$EDITOR" >> "$GITHUB_ENV"
+
+          "$EDITOR" -version || true
+
+      - name: Prepare Unity Licensing Client
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          find_client() {
+            find \
+              /usr \
+              /opt \
+              "$HOME" \
+              -type f \
+              -name "Unity.Licensing.Client" \
+              2>/dev/null \
+              | head -1
+          }
+
+          CLIENT="$(find_client || true)"
+
+          if [ -z "$CLIENT" ]; then
+            echo "ERROR: Unity.Licensing.Client was not found."
+            find /usr /opt "$HOME" \
+              -type f \
+              -iname '*Licensing*Client*' \
+              2>/dev/null \
+              | head -300 || true
+            exit 1
+          fi
+
+          CLIENT_DIR="$(dirname "$CLIENT")"
+
+          sudo rm -rf /opt/unityhub/UnityLicensingClient
+          sudo mkdir -p /opt/unityhub/UnityLicensingClient
+          sudo cp -a "$CLIENT_DIR"/. /opt/unityhub/UnityLicensingClient/
+          sudo chmod +x \
+            /opt/unityhub/UnityLicensingClient/Unity.Licensing.Client \
+            || true
+
+          test -f \
+            /opt/unityhub/UnityLicensingClient/Unity.Licensing.Client
+
+          echo "Licensing client staged from: $CLIENT"
+
+      - name: Activate Unity Personal
+        shell: bash
+        env:
+          UNITY_HUB_PATH: /opt/unityhub/unityhub
+        run: |
+          set -euo pipefail
+
+          GLOBAL_NODE_MODULES="$(npm root -g)"
+          LICENSE_MODULE="$GLOBAL_NODE_MODULES/@rage-against-the-pixel/unity-cli/dist/license-client.js"
+
+          if [ ! -f "$LICENSE_MODULE" ]; then
+            echo "ERROR: unity-cli license module not found."
+            exit 1
+          fi
+
+          export LICENSE_MODULE
+
+          node <<'NODE'
+          const {
+            LicensingClient,
+            LicenseType
+          } = require(process.env.LICENSE_MODULE);
+
+          async function main() {
+            const client = new LicensingClient('6.x');
+
+            await client.Activate(
+              {
+                licenseType: LicenseType.personal,
+                username: process.env.UNITY_USERNAME,
+                password: process.env.UNITY_PASSWORD
+              },
+              true
+            );
+
+            console.log("UNITY PERSONAL ACTIVATION: SUCCESS");
+          }
+
+          main().catch((error) => {
+            console.error("UNITY PERSONAL ACTIVATION FAILED");
+            console.error(error && error.message ? error.message : error);
+            process.exit(1);
+          });
+          NODE
+
+          unity-cli license-context || true
+
+      - name: Verify activated license
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LICENSE_FILE=""
+
+          for CANDIDATE in \
+            "$HOME/.local/share/unity3d/Unity/Unity_lic.ulf" \
+            "$HOME/.config/unity3d/Unity/Unity_lic.ulf" \
+            "/root/.local/share/unity3d/Unity/Unity_lic.ulf" \
+            "/root/.config/unity3d/Unity/Unity_lic.ulf"
+          do
+            if [ -s "$CANDIDATE" ]; then
+              LICENSE_FILE="$CANDIDATE"
+              break
+            fi
+          done
+
+          if [ -z "$LICENSE_FILE" ]; then
+            LICENSE_FILE="$(
+              find "$HOME" /root \
+                -type f \
+                -name '*.ulf' \
+                2>/dev/null \
+                | head -1
+            )"
+          fi
+
+          if [ -z "$LICENSE_FILE" ] || [ ! -s "$LICENSE_FILE" ]; then
+            echo "ERROR: Unity activation finished but .ulf file was not found."
+            exit 1
+          fi
+
+          echo "Unity license file: $LICENSE_FILE"
+          echo "License size: $(wc -c < "$LICENSE_FILE") bytes"
+
+      - name: Build Unity iOS Xcode project
+        id: unity_build
+        continue-on-error: true
+        shell: bash
+        env:
+          HTF_IOS_XCODE_PATH: ${{ github.workspace }}/build/iOS/HowToFish-iOS
+        run: |
+          set +e
+
+          PROJECT="${{ steps.locate.outputs.project }}"
+          LOG="$GITHUB_WORKSPACE/output/unity-ios-build.log"
+
+          sudo rm -rf "$PROJECT/Library" "$PROJECT/Temp" "$PROJECT/obj" \
+            2>/dev/null || true
+
+          sudo chown -R "$(id -u):$(id -g)" "$PROJECT" build output \
+            2>/dev/null || true
+
+          echo "===== UNITY iOS BUILD ====="
+          echo "Editor: $UNITY_EDITOR"
+          echo "Project: $PROJECT"
+          echo "Output: $HTF_IOS_XCODE_PATH"
+
+          timeout 90m xvfb-run -a "$UNITY_EDITOR" \
+            -batchmode \
+            -nographics \
+            -quit \
+            -projectPath "$PROJECT" \
+            -executeMethod HowToFishIOSBuild.PerformBuild \
+            -accept-apiupdate \
+            -logFile "$LOG"
+
+          RC=$?
+          echo "UNITY_EXIT_CODE=$RC" | tee output/unity-exit-code.txt
+
+          tail -400 "$LOG" || true
+          exit "$RC"
+
+      - name: Detect Xcode project
+        id: detect_xcode
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          PROJ="$(
+            find build \
+              -type d \
+              -name '*.xcodeproj' \
+              -print \
+              | head -1
+          )"
+
+          if [ -n "$PROJ" ] && [ -f "$PROJ/project.pbxproj" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "xcode_project=$PROJ" >> "$GITHUB_OUTPUT"
+            echo "XCODE PROJECT FOUND: $PROJ"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No Xcode project was generated."
+          fi
+
+      - name: Collect Unity diagnostics
+        if: always() && steps.detect_xcode.outputs.ready != 'true'
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p unity-build-diagnostics
+
+          cp output/unity-ios-build.log \
+            unity-build-diagnostics/ 2>/dev/null || true
+
+          cp output/unity-install.log \
+            unity-build-diagnostics/ 2>/dev/null || true
+
+          cp output/platform-references.txt \
+            unity-build-diagnostics/ 2>/dev/null || true
+
+          cp output/scenes.txt \
+            unity-build-diagnostics/ 2>/dev/null || true
+
+          cp output/removed-android-native-files.txt \
+            unity-build-diagnostics/ 2>/dev/null || true
+
+          {
+            echo "UNITY_VERSION=6000.4.4f1"
+            echo "UNITY_CHANGESET=360f97ecca93"
+            echo "UNITY_BUILD_OUTCOME=${{ steps.unity_build.outcome }}"
+            echo "XCODE_READY=${{ steps.detect_xcode.outputs.ready }}"
+            echo "PROJECT=${{ steps.locate.outputs.project }}"
+          } > unity-build-diagnostics/summary.txt
+
+          grep -RniE \
+            'error CS[0-9]+|Compilation failed|compiler error|Exception|error:|failed|FAILURE|DllNotFoundException|MissingReferenceException|TypeLoadException|Assertion|SIGABRT|crash' \
+            unity-build-diagnostics \
+            > unity-build-diagnostics/important-errors.txt \
+            2>/dev/null || true
+
+          echo "===== IMPORTANT BUILD ERRORS ====="
+          tail -500 unity-build-diagnostics/important-errors.txt || true
+
+      - name: Upload Xcode project
+        if: steps.detect_xcode.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: How-to-Fish-iOS-Xcode-v1
+          path: build/iOS/HowToFish-iOS
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload Unity build diagnostics
+        if: always() && steps.detect_xcode.outputs.ready != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: How-to-Fish-iOS-Unity-Diagnostics-v1
+          path: unity-build-diagnostics
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: Fail if Xcode was not generated
+        if: always() && steps.detect_xcode.outputs.ready != 'true'
+        shell: bash
+        run: |
+          echo "Unity did not generate an iOS Xcode project."
+          echo "Download: How-to-Fish-iOS-Unity-Diagnostics-v1"
+          exit 1
+
+  make_ipa:
+    name: 2. Build unsigned IPA
+    needs: build_unity_ios
+    if: needs.build_unity_ios.outputs.xcode_ready == 'true'
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Download Unity Xcode project
+        uses: actions/download-artifact@v4
+        with:
+          name: How-to-Fish-iOS-Xcode-v1
+          path: unity-ios
+
+      - name: Inspect Xcode project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJ="$(
+            find unity-ios \
+              -type d \
+              -name '*.xcodeproj' \
+              -print \
+              | head -1
+          )"
+
+          if [ -z "$PROJ" ]; then
+            echo "ERROR: Xcode project not found."
+            exit 1
+          fi
+
+          echo "XCODE_PROJECT=$PROJ" >> "$GITHUB_ENV"
+
+          echo "===== XCODE VERSION ====="
+          xcodebuild -version
+
+          echo "===== PROJECT ====="
+          echo "$PROJ"
+          xcodebuild -list -project "$PROJ"
+
+      - name: Enable Files app logs in Info.plist
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$(dirname "$XCODE_PROJECT")"
+
+          PLIST="$(
+            find "$ROOT" \
+              -type f \
+              -name 'Info.plist' \
+              -print \
+              | head -1
+          )"
+
+          if [ -z "$PLIST" ]; then
+            echo "WARNING: Info.plist not found before build."
+            exit 0
+          fi
+
+          /usr/libexec/PlistBuddy \
+            -c "Delete :UIFileSharingEnabled" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy \
+            -c "Add :UIFileSharingEnabled bool true" "$PLIST"
+
+          /usr/libexec/PlistBuddy \
+            -c "Delete :LSSupportsOpeningDocumentsInPlace" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy \
+            -c "Add :LSSupportsOpeningDocumentsInPlace bool true" "$PLIST"
+
+          /usr/libexec/PlistBuddy \
+            -c "Delete :ITSAppUsesNonExemptEncryption" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy \
+            -c "Add :ITSAppUsesNonExemptEncryption bool false" "$PLIST"
+
+          echo "===== PATCHED INFO.PLIST ====="
+          /usr/libexec/PlistBuddy -c "Print" "$PLIST" | head -220
+
+      - name: Build unsigned iPhone app
+        id: xcode_build
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+
+          rm -rf DerivedData xcode-build.log
+
+          echo "===== BUILD UNITY-IPHONE ====="
+
+          xcodebuild \
+            -project "$XCODE_PROJECT" \
+            -scheme "Unity-iPhone" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$PWD/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build \
+            2>&1 | tee xcode-build.log
+
+          RC=${PIPESTATUS[0]}
+          echo "XCODE_EXIT_CODE=$RC"
+          exit "$RC"
+
+      - name: Find built app
+        id: app
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          APP="$(
+            find DerivedData \
+              -type d \
+              -name '*.app' \
+              -path '*Release-iphoneos*' \
+              -print \
+              | head -1
+          )"
+
+          if [ -n "$APP" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "path=$APP" >> "$GITHUB_OUTPUT"
+            echo "APP FOUND: $APP"
+            du -sh "$APP" || true
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "APP NOT FOUND"
+          fi
+
+      - name: Package unsigned IPA
+        if: steps.app.outputs.found == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP="${{ steps.app.outputs.path }}"
+
+          rm -rf Payload
+          mkdir -p Payload
+          cp -a "$APP" Payload/
+
+          /usr/bin/xattr -cr Payload || true
+
+          ditto \
+            -c \
+            -k \
+            --sequesterRsrc \
+            --keepParent \
+            Payload \
+            "How-to-Fish-iOS-v1-unsigned.ipa"
+
+          echo "===== IPA ====="
+          ls -lh "How-to-Fish-iOS-v1-unsigned.ipa"
+
+      - name: Upload IPA
+        if: steps.app.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: How-to-Fish-iOS-v1-IPA
+          path: How-to-Fish-iOS-v1-unsigned.ipa
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Collect Xcode diagnostics
+        if: always() && steps.app.outputs.found != 'true'
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p xcode-diagnostics
+          cp xcode-build.log xcode-diagnostics/ 2>/dev/null || true
+
+          {
+            echo "XCODE_BUILD_OUTCOME=${{ steps.xcode_build.outcome }}"
+            echo "APP_FOUND=${{ steps.app.outputs.found }}"
+            xcodebuild -version
+          } > xcode-diagnostics/summary.txt
+
+          grep -niE \
+            'error:|fatal error|Undefined symbols|ld:|clang: error|PhaseScriptExecution.*failed|BUILD FAILED' \
+            xcode-build.log \
+            > xcode-diagnostics/important-errors.txt \
+            2>/dev/null || true
+
+          tail -400 xcode-diagnostics/important-errors.txt || true
+
+      - name: Upload Xcode diagnostics
+        if: always() && steps.app.outputs.found != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: How-to-Fish-iOS-Xcode-Diagnostics-v1
+          path: xcode-diagnostics
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: Final status
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.app.outputs.found }}" != "true" ]; then
+            echo "IPA was not created."
+            echo "Download: How-to-Fish-iOS-Xcode-Diagnostics-v1"
+            exit 1
+          fi
+
+          echo "SUCCESS: How-to-Fish-iOS-v1-unsigned.ipa"
+          echo "Artifact: How-to-Fish-iOS-v1-IPA"
