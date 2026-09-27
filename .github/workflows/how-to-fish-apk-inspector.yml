@@ -1,0 +1,247 @@
+name: How to Fish - APK Inspector
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    name: Inspect How to Fish APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare
+        run: |
+          set -e
+          rm -rf work inspection release-files
+          mkdir -p work inspection release-files
+
+      - name: Download APK from newest Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG=$(gh release list --limit 1 --json tagName --jq '.[0].tagName')
+          if [ -z "$TAG" ]; then
+            echo "ERROR: No GitHub Release found."
+            exit 1
+          fi
+
+          echo "Newest release: $TAG"
+          gh release download "$TAG" --dir release-files --pattern "*.apk"
+
+          echo "===== APK FILES ====="
+          find release-files -type f -iname "*.apk" -printf '%s %p\n' | sort -nr
+
+          APK=$(
+            find release-files -type f -iname "*.apk" -printf '%s %p\n' \
+              | sort -nr | head -1 | cut -d' ' -f2-
+          )
+
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "ERROR: No APK asset found in newest Release."
+            exit 1
+          fi
+
+          cp "$APK" work/how-to-fish.apk
+          echo "$APK" > inspection/original-apk-path.txt
+          ls -lh work/how-to-fish.apk | tee inspection/apk-size.txt
+
+      - name: Extract APK
+        run: |
+          set -e
+          mkdir -p work/apk
+          unzip -q work/how-to-fish.apk -d work/apk
+
+          echo "===== ROOT =====" | tee inspection/root.txt
+          find work/apk -maxdepth 1 -mindepth 1 -printf '%f\n' | sort \
+            | tee -a inspection/root.txt
+
+          find work/apk -maxdepth 4 -type f -printf '%p  %s bytes\n' \
+            | sort | head -2000 > inspection/tree.txt
+
+      - name: Detect Unity and backend
+        run: |
+          set +e
+          UNITY_LIB=$(find work/apk -type f -name "libunity.so" -print | head -1)
+          IL2CPP_LIB=$(find work/apk -type f -name "libil2cpp.so" -print | head -1)
+          MAIN_LIB=$(find work/apk -type f -name "libmain.so" -print | head -1)
+          META=$(find work/apk -type f -name "global-metadata.dat" -print | head -1)
+          CSHARP=$(find work/apk -type f -name "Assembly-CSharp.dll" -print | head -1)
+
+          echo "LIBUNITY=$UNITY_LIB" | tee inspection/backend.txt
+          echo "LIBIL2CPP=$IL2CPP_LIB" | tee -a inspection/backend.txt
+          echo "LIBMAIN=$MAIN_LIB" | tee -a inspection/backend.txt
+          echo "GLOBAL_METADATA=$META" | tee -a inspection/backend.txt
+          echo "ASSEMBLY_CSHARP=$CSHARP" | tee -a inspection/backend.txt
+
+          if [ -n "$UNITY_LIB" ] && [ -n "$IL2CPP_LIB" ]; then
+            BACKEND="IL2CPP"
+          elif [ -n "$UNITY_LIB" ] && [ -n "$CSHARP" ]; then
+            BACKEND="MONO"
+          elif [ -n "$UNITY_LIB" ]; then
+            BACKEND="UNITY-UNKNOWN"
+          else
+            BACKEND="NOT-UNITY"
+          fi
+
+          echo "BACKEND=$BACKEND" | tee -a inspection/backend.txt
+
+      - name: List ABIs and native libraries
+        run: |
+          set +e
+          echo "===== ABI DIRECTORIES =====" | tee inspection/abis.txt
+          if [ -d work/apk/lib ]; then
+            find work/apk/lib -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+              | sort | tee -a inspection/abis.txt
+          fi
+
+          echo "===== NATIVE LIBRARIES =====" | tee inspection/native-libs.txt
+          find work/apk/lib -type f -name "*.so" -printf '%p  %s bytes\n' 2>/dev/null \
+            | sort | tee -a inspection/native-libs.txt
+
+      - name: Inspect Unity Data layout
+        run: |
+          set +e
+          echo "===== UNITY DATA CANDIDATES =====" | tee inspection/unity-data.txt
+
+          find work/apk -type f \
+            \( -name "globalgamemanagers" \
+               -o -name "data.unity3d" \
+               -o -name "datapack.unity3d" \
+               -o -name "resources.assets" \
+               -o -name "sharedassets*.assets" \
+               -o -name "ScriptingAssemblies.json" \
+               -o -name "RuntimeInitializeOnLoads.json" \
+               -o -name "boot.config" \
+               -o -name "unity_app_guid" \
+               -o -name "global-metadata.dat" \
+               -o -name "Assembly-CSharp.dll" \) \
+            -printf '%p  %s bytes\n' \
+            | sort | tee -a inspection/unity-data.txt
+
+          echo "===== DATA DIRECTORY =====" | tee inspection/data-directory.txt
+          DATA_DIR=$(find work/apk -type f -name "boot.config" -print | head -1 | xargs -r dirname)
+          echo "DATA_DIR=$DATA_DIR" | tee -a inspection/data-directory.txt
+
+          if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+            find "$DATA_DIR" -maxdepth 4 -type f -printf '%p  %s bytes\n' \
+              | sort | head -2000 >> inspection/data-directory.txt
+          fi
+
+      - name: Detect Unity version
+        run: |
+          set +e
+          : > inspection/unity-version-candidates.txt
+
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            echo "===== $f =====" >> inspection/unity-version-candidates.txt
+            strings "$f" 2>/dev/null \
+              | grep -Eo '20[0-9]{2}\.[0-9]+\.[0-9]+[abfp][0-9]+' \
+              | sort -u | head -50 \
+              >> inspection/unity-version-candidates.txt
+          done < <(
+            find work/apk -type f \
+              \( -name "globalgamemanagers" -o -name "data.unity3d" \
+                 -o -name "datapack.unity3d" -o -name "libunity.so" \) \
+              -print 2>/dev/null
+          )
+
+          VERSION=$(
+            grep -Eo '20[0-9]{2}\.[0-9]+\.[0-9]+[abfp][0-9]+' \
+              inspection/unity-version-candidates.txt \
+              | sort -u | head -1
+          )
+
+          [ -n "$VERSION" ] || VERSION="UNKNOWN"
+          echo "UNITY_VERSION=$VERSION" | tee inspection/unity-version.txt
+
+      - name: Search IL2CPP metadata
+        run: |
+          set +e
+          echo "===== GLOBAL METADATA SEARCH =====" | tee inspection/metadata-search.txt
+          find work/apk -type f -name "global-metadata.dat" -printf '%p  %s bytes\n' \
+            | tee -a inspection/metadata-search.txt
+
+          echo "===== METADATA-LIKE FILES =====" | tee inspection/metadata-like-files.txt
+          find work/apk -type f \
+            \( -iname "*metadata*" -o -iname "*il2cpp*" -o -iname "*scriptingassemblies*" \) \
+            -printf '%p  %s bytes\n' \
+            | sort | tee -a inspection/metadata-like-files.txt
+
+      - name: Inspect Managed folder
+        run: |
+          set +e
+          echo "===== MANAGED =====" | tee inspection/managed.txt
+
+          while IFS= read -r d; do
+            [ -d "$d" ] || continue
+            echo "----- $d -----" | tee -a inspection/managed.txt
+            find "$d" -maxdepth 3 -type f -printf '%p  %s bytes\n' \
+              | sort | tee -a inspection/managed.txt
+          done < <(find work/apk -type d -name "Managed" -print)
+
+      - name: Scan UnityFS bundles
+        run: |
+          set +e
+          : > inspection/unityfs.txt
+          find work/apk -type f -size +32k -size -600M -print0 \
+            | while IFS= read -r -d '' f; do
+                if head -c 64 "$f" 2>/dev/null | grep -aq "UnityFS"; then
+                  stat -c '%n  %s bytes' "$f"
+                fi
+              done \
+            | tee inspection/unityfs.txt
+
+      - name: Make summary
+        run: |
+          set +e
+          BACKEND=$(grep '^BACKEND=' inspection/backend.txt 2>/dev/null | cut -d= -f2-)
+          VERSION=$(grep '^UNITY_VERSION=' inspection/unity-version.txt 2>/dev/null | cut -d= -f2-)
+          META=$(grep '^GLOBAL_METADATA=' inspection/backend.txt 2>/dev/null | cut -d= -f2-)
+
+          {
+            echo "HOW TO FISH APK INSPECTION"
+            echo "=========================="
+            echo "Backend: ${BACKEND:-UNKNOWN}"
+            echo "Unity version: ${VERSION:-UNKNOWN}"
+            echo
+            echo "global-metadata.dat:"
+            if [ -n "$META" ]; then
+              echo "FOUND -> $META"
+            else
+              echo "NOT FOUND in extracted APK"
+            fi
+            echo
+            echo "ABIs:"
+            tail -n +2 inspection/abis.txt 2>/dev/null || true
+            echo
+            echo "Important Unity files:"
+            cat inspection/unity-data.txt 2>/dev/null || true
+          } | tee inspection/SUMMARY.txt
+
+      - name: Upload inspection artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: How-to-Fish-APK-Inspection
+          path: inspection
+          if-no-files-found: warn
+          compression-level: 0
+
+      - name: Show final result
+        if: always()
+        run: |
+          echo
+          echo "========================================"
+          cat inspection/SUMMARY.txt 2>/dev/null || true
+          echo "========================================"
+          echo
+          echo "Artifact: How-to-Fish-APK-Inspection"
