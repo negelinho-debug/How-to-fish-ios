@@ -1,4 +1,4 @@
-name: How to Fish iOS - v5 REAL IPA
+name: How to Fish iOS - v6 REAL IPA
 
 on:
   workflow_dispatch:
@@ -54,6 +54,7 @@ jobs:
           mkdir -p unity-ios
 
           gh run download "$RUN_ID" \
+            -R "$GITHUB_REPOSITORY" \
             --name "How-to-Fish-iOS-Xcode-v4" \
             --dir unity-ios
 
@@ -261,9 +262,9 @@ jobs:
             --sequesterRsrc \
             --keepParent \
             Payload \
-            "How-to-Fish-iOS-v5-unsigned.ipa"
+            "How-to-Fish-iOS-v6-unsigned.ipa"
 
-          IPA_SIZE="$(stat -f%z How-to-Fish-iOS-v5-unsigned.ipa)"
+          IPA_SIZE="$(stat -f%z How-to-Fish-iOS-v6-unsigned.ipa)"
 
           if [ "$IPA_SIZE" -lt 1048576 ]; then
             echo "ERROR: IPA is too small: $IPA_SIZE bytes"
@@ -271,17 +272,17 @@ jobs:
           fi
 
           echo "===== REAL IPA VERIFIED ====="
-          ls -lh How-to-Fish-iOS-v5-unsigned.ipa
+          ls -lh How-to-Fish-iOS-v6-unsigned.ipa
           echo "IPA_SIZE_BYTES=$IPA_SIZE"
 
-          unzip -l How-to-Fish-iOS-v5-unsigned.ipa \
+          unzip -l How-to-Fish-iOS-v6-unsigned.ipa \
             | head -100
 
       - name: Upload REAL IPA
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-v5-REAL-IPA
-          path: How-to-Fish-iOS-v5-unsigned.ipa
+          name: How-to-Fish-iOS-v6-REAL-IPA
+          path: How-to-Fish-iOS-v6-unsigned.ipa
           if-no-files-found: error
           compression-level: 0
 
@@ -289,7 +290,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-v5-Xcode-Log
+          name: How-to-Fish-iOS-v6-Xcode-Log
           path: xcode-build.log
           if-no-files-found: ignore
           compression-level: 0
