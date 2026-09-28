@@ -1,4 +1,4 @@
-name: How to Fish iOS - v3 IPA
+name: How to Fish iOS - v4 IPA
 
 on:
   workflow_dispatch:
@@ -445,6 +445,50 @@ jobs:
           echo
           echo "v3: official URP 17.4.0 will now be resolved by Unity Package Manager."
 
+      - name: Remove duplicate AssetRipper Unity package stubs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.locate.outputs.project }}"
+          BACKUP="$GITHUB_WORKSPACE/output/assetripper-package-stubs-v4"
+          mkdir -p "$BACKUP"
+
+          echo "===== v4 FIX: REMOVE DUPLICATE UNITY PACKAGE DLL STUBS ====="
+
+          for NAME in \
+            Unity.TextMeshPro.dll \
+            UnityEngine.UI.dll \
+            System.Runtime.CompilerServices.Unsafe.dll \
+            Unity.Burst.dll \
+            Unity.Burst.Unsafe.dll \
+            Unity.Collections.dll \
+            Unity.Collections.LowLevel.ILSupport.dll \
+            Unity.Mathematics.dll
+          do
+            FILE="$PROJECT/Assets/Plugins/$NAME"
+            if [ -f "$FILE" ]; then
+              echo "MOVE $FILE -> $BACKUP/$NAME"
+              mv "$FILE" "$BACKUP/$NAME"
+              if [ -f "$FILE.meta" ]; then
+                mv "$FILE.meta" "$BACKUP/$NAME.meta"
+              fi
+            fi
+          done
+
+          {
+            echo "===== MOVED DUPLICATE PACKAGE STUBS ====="
+            find "$BACKUP" -maxdepth 1 -type f -printf '%f  %s bytes\n' | sort
+          } | tee output/v4-moved-package-stubs.txt
+
+          rm -rf \
+            "$PROJECT/Library" \
+            "$PROJECT/Temp" \
+            "$PROJECT/obj" \
+            2>/dev/null || true
+
+          echo "v4 fixes duplicate TMPro and Unsafe/Burst/Collections package stubs."
+
       - name: Record AssetRipper plugin DLLs
         shell: bash
         run: |
@@ -768,7 +812,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" "$PROJECT" build output \
             2>/dev/null || true
 
-          echo "===== UNITY iOS BUILD v3 - OFFICIAL URP FIX ====="
+          echo "===== UNITY iOS BUILD v4 - DUPLICATE PACKAGE STUB FIX ====="
           echo "Editor: $UNITY_EDITOR"
           echo "Project: $PROJECT"
           echo "Output: $HTF_IOS_XCODE_PATH"
@@ -842,6 +886,9 @@ jobs:
           cp output/v3-moved-urp-stubs.txt \
             unity-build-diagnostics/ 2>/dev/null || true
 
+          cp output/v4-moved-package-stubs.txt \
+            unity-build-diagnostics/ 2>/dev/null || true
+
           if [ -f "${{ steps.locate.outputs.project }}/Packages/packages-lock.json" ]; then
             cp "${{ steps.locate.outputs.project }}/Packages/packages-lock.json" \
               unity-build-diagnostics/packages-lock.json 2>/dev/null || true
@@ -878,7 +925,7 @@ jobs:
         if: steps.detect_xcode.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-v3
+          name: How-to-Fish-iOS-Xcode-v4
           path: build/iOS/HowToFish-iOS
           if-no-files-found: error
           compression-level: 0
@@ -887,7 +934,7 @@ jobs:
         if: always() && steps.detect_xcode.outputs.ready != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Unity-Diagnostics-v3
+          name: How-to-Fish-iOS-Unity-Diagnostics-v4
           path: unity-build-diagnostics
           if-no-files-found: warn
           compression-level: 0
@@ -897,7 +944,7 @@ jobs:
         shell: bash
         run: |
           echo "Unity did not generate an iOS Xcode project."
-          echo "Download: How-to-Fish-iOS-Unity-Diagnostics-v3"
+          echo "Download: How-to-Fish-iOS-Unity-Diagnostics-v4"
           exit 1
 
   make_ipa:
@@ -911,7 +958,7 @@ jobs:
       - name: Download Unity Xcode project
         uses: actions/download-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-v3
+          name: How-to-Fish-iOS-Xcode-v4
           path: unity-ios
 
       - name: Inspect Xcode project
@@ -1053,17 +1100,17 @@ jobs:
             --sequesterRsrc \
             --keepParent \
             Payload \
-            "How-to-Fish-iOS-v3-unsigned.ipa"
+            "How-to-Fish-iOS-v4-unsigned.ipa"
 
           echo "===== IPA ====="
-          ls -lh "How-to-Fish-iOS-v3-unsigned.ipa"
+          ls -lh "How-to-Fish-iOS-v4-unsigned.ipa"
 
       - name: Upload IPA
         if: steps.app.outputs.found == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-v3-IPA
-          path: How-to-Fish-iOS-v3-unsigned.ipa
+          name: How-to-Fish-iOS-v4-IPA
+          path: How-to-Fish-iOS-v4-unsigned.ipa
           if-no-files-found: error
           compression-level: 0
 
@@ -1094,7 +1141,7 @@ jobs:
         if: always() && steps.app.outputs.found != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-Diagnostics-v3
+          name: How-to-Fish-iOS-Xcode-Diagnostics-v4
           path: xcode-diagnostics
           if-no-files-found: warn
           compression-level: 0
@@ -1105,9 +1152,9 @@ jobs:
         run: |
           if [ "${{ steps.app.outputs.found }}" != "true" ]; then
             echo "IPA was not created."
-            echo "Download: How-to-Fish-iOS-Xcode-Diagnostics-v3"
+            echo "Download: How-to-Fish-iOS-Xcode-Diagnostics-v4"
             exit 1
           fi
 
-          echo "SUCCESS: How-to-Fish-iOS-v3-unsigned.ipa"
-          echo "Artifact: How-to-Fish-iOS-v3-IPA"
+          echo "SUCCESS: How-to-Fish-iOS-v4-unsigned.ipa"
+          echo "Artifact: How-to-Fish-iOS-v4-IPA"
