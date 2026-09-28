@@ -1,4 +1,4 @@
-name: How to Fish iOS - v2 IPA
+name: How to Fish iOS - v3 IPA
 
 on:
   workflow_dispatch:
@@ -361,6 +361,90 @@ jobs:
           echo "===== BUILD SCRIPT CREATED ====="
           sed -n '1,260p' "$PROJECT/Assets/Editor/HowToFishIOSBuild.cs"
 
+      - name: Replace broken AssetRipper URP stubs with official URP 17.4.0
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.locate.outputs.project }}"
+          MANIFEST="$PROJECT/Packages/manifest.json"
+          BACKUP="$GITHUB_WORKSPACE/output/assetripper-urp-stubs"
+
+          echo "===== v3 FIX: ASSETRIPPER URP STUBS -> OFFICIAL URP ====="
+
+          mkdir -p "$PROJECT/Packages" "$BACKUP"
+
+          if [ ! -f "$MANIFEST" ]; then
+            printf '{\n  "dependencies": {}\n}\n' > "$MANIFEST"
+          fi
+
+          cp "$MANIFEST" output/manifest-before-v3.json
+
+          # AssetRipper exported IL2CPP-derived Unity package DLL stubs into
+          # Assets/Plugins. Unity 6000.4's MovedFromExtractor crashes on
+          # Unity.RenderPipelines.Universal.Runtime.dll before script compile.
+          #
+          # Use the real URP package that belongs to Unity 6000.4 instead.
+          python3 - "$MANIFEST" <<'PY'
+          import json, sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          data = json.loads(path.read_text(encoding="utf-8"))
+          deps = data.setdefault("dependencies", {})
+
+          # Unity 6000.4 ships URP/SRP Core/ShaderGraph generation 17.4.
+          deps["com.unity.render-pipelines.universal"] = "17.4.0"
+
+          path.write_text(
+              json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+              encoding="utf-8"
+          )
+          PY
+
+          rm -f "$PROJECT/Packages/packages-lock.json" || true
+
+          echo "===== MANIFEST AFTER v3 FIX ====="
+          cat "$MANIFEST" | tee output/manifest-after-v3.json
+
+          # Remove only the AssetRipper-generated render-pipeline DLL stubs that
+          # conflict with / crash against the real URP package. Keep a backup
+          # outside Assets so diagnostics can show exactly what was changed.
+          for NAME in \
+            Unity.RenderPipelines.Universal.Runtime.dll \
+            Unity.RenderPipeline.Universal.ShaderLibrary.dll \
+            Unity.RenderPipelines.Core.Runtime.dll \
+            Unity.RenderPipelines.Core.Runtime.Shared.dll \
+            Unity.RenderPipelines.GPUDriven.Runtime.dll \
+            Unity.UnifiedRayTracing.Runtime.dll
+          do
+            FILE="$PROJECT/Assets/Plugins/$NAME"
+
+            if [ -f "$FILE" ]; then
+              echo "MOVE $FILE -> $BACKUP/$NAME"
+              mv "$FILE" "$BACKUP/$NAME"
+
+              if [ -f "$FILE.meta" ]; then
+                mv "$FILE.meta" "$BACKUP/$NAME.meta"
+              fi
+            fi
+          done
+
+          {
+            echo "===== MOVED URP/SRP STUBS ====="
+            find "$BACKUP" -maxdepth 1 -type f -printf '%f  %s bytes\n' | sort
+          } | tee output/v3-moved-urp-stubs.txt
+
+          # Force a fresh package resolution and script graph.
+          rm -rf \
+            "$PROJECT/Library" \
+            "$PROJECT/Temp" \
+            "$PROJECT/obj" \
+            2>/dev/null || true
+
+          echo
+          echo "v3: official URP 17.4.0 will now be resolved by Unity Package Manager."
+
       - name: Record AssetRipper plugin DLLs
         shell: bash
         run: |
@@ -684,7 +768,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" "$PROJECT" build output \
             2>/dev/null || true
 
-          echo "===== UNITY iOS BUILD ====="
+          echo "===== UNITY iOS BUILD v3 - OFFICIAL URP FIX ====="
           echo "Editor: $UNITY_EDITOR"
           echo "Project: $PROJECT"
           echo "Output: $HTF_IOS_XCODE_PATH"
@@ -749,6 +833,24 @@ jobs:
           cp output/assetripper-plugin-dlls.txt \
             unity-build-diagnostics/ 2>/dev/null || true
 
+          cp output/manifest-before-v3.json \
+            unity-build-diagnostics/ 2>/dev/null || true
+
+          cp output/manifest-after-v3.json \
+            unity-build-diagnostics/ 2>/dev/null || true
+
+          cp output/v3-moved-urp-stubs.txt \
+            unity-build-diagnostics/ 2>/dev/null || true
+
+          if [ -f "${{ steps.locate.outputs.project }}/Packages/packages-lock.json" ]; then
+            cp "${{ steps.locate.outputs.project }}/Packages/packages-lock.json" \
+              unity-build-diagnostics/packages-lock.json 2>/dev/null || true
+          fi
+
+          find "${{ steps.locate.outputs.project }}/Library/PackageCache" \
+            -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null \
+            | sort > unity-build-diagnostics/package-cache.txt || true
+
           cp output/scenes.txt \
             unity-build-diagnostics/ 2>/dev/null || true
 
@@ -764,7 +866,7 @@ jobs:
           } > unity-build-diagnostics/summary.txt
 
           grep -RniE \
-            'error CS[0-9]+|Compilation failed|compiler error|Exception|error:|failed|FAILURE|DllNotFoundException|MissingReferenceException|TypeLoadException|Assertion|SIGABRT|crash|ApiUpdater|MovedFromExtractor|NotImplementedException|NullReferenceException' \
+            'error CS[0-9]+|Compilation failed|compiler error|Exception|error:|failed|FAILURE|DllNotFoundException|MissingReferenceException|TypeLoadException|Assertion|SIGABRT|crash|ApiUpdater|MovedFromExtractor|NotImplementedException|NullReferenceException|Package Manager|UPM|render-pipelines|duplicate assembly|Assembly with name' \
             unity-build-diagnostics \
             > unity-build-diagnostics/important-errors.txt \
             2>/dev/null || true
@@ -776,7 +878,7 @@ jobs:
         if: steps.detect_xcode.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-v2
+          name: How-to-Fish-iOS-Xcode-v3
           path: build/iOS/HowToFish-iOS
           if-no-files-found: error
           compression-level: 0
@@ -785,7 +887,7 @@ jobs:
         if: always() && steps.detect_xcode.outputs.ready != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Unity-Diagnostics-v2
+          name: How-to-Fish-iOS-Unity-Diagnostics-v3
           path: unity-build-diagnostics
           if-no-files-found: warn
           compression-level: 0
@@ -795,7 +897,7 @@ jobs:
         shell: bash
         run: |
           echo "Unity did not generate an iOS Xcode project."
-          echo "Download: How-to-Fish-iOS-Unity-Diagnostics-v2"
+          echo "Download: How-to-Fish-iOS-Unity-Diagnostics-v3"
           exit 1
 
   make_ipa:
@@ -809,7 +911,7 @@ jobs:
       - name: Download Unity Xcode project
         uses: actions/download-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-v2
+          name: How-to-Fish-iOS-Xcode-v3
           path: unity-ios
 
       - name: Inspect Xcode project
@@ -951,17 +1053,17 @@ jobs:
             --sequesterRsrc \
             --keepParent \
             Payload \
-            "How-to-Fish-iOS-v2-unsigned.ipa"
+            "How-to-Fish-iOS-v3-unsigned.ipa"
 
           echo "===== IPA ====="
-          ls -lh "How-to-Fish-iOS-v2-unsigned.ipa"
+          ls -lh "How-to-Fish-iOS-v3-unsigned.ipa"
 
       - name: Upload IPA
         if: steps.app.outputs.found == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-v2-IPA
-          path: How-to-Fish-iOS-v2-unsigned.ipa
+          name: How-to-Fish-iOS-v3-IPA
+          path: How-to-Fish-iOS-v3-unsigned.ipa
           if-no-files-found: error
           compression-level: 0
 
@@ -992,7 +1094,7 @@ jobs:
         if: always() && steps.app.outputs.found != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-Diagnostics-v2
+          name: How-to-Fish-iOS-Xcode-Diagnostics-v3
           path: xcode-diagnostics
           if-no-files-found: warn
           compression-level: 0
@@ -1003,9 +1105,9 @@ jobs:
         run: |
           if [ "${{ steps.app.outputs.found }}" != "true" ]; then
             echo "IPA was not created."
-            echo "Download: How-to-Fish-iOS-Xcode-Diagnostics-v2"
+            echo "Download: How-to-Fish-iOS-Xcode-Diagnostics-v3"
             exit 1
           fi
 
-          echo "SUCCESS: How-to-Fish-iOS-v2-unsigned.ipa"
-          echo "Artifact: How-to-Fish-iOS-v2-IPA"
+          echo "SUCCESS: How-to-Fish-iOS-v3-unsigned.ipa"
+          echo "Artifact: How-to-Fish-iOS-v3-IPA"
