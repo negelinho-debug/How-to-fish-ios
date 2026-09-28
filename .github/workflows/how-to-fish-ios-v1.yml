@@ -1,5 +1,5 @@
-# v9: targeted JSON/Services build fix. Not a verified playable or offline port.
-name: How to Fish iOS - v9 Build candidate
+# v10: targeted JSON/Services build fix. Not a verified playable or offline port.
+name: How to Fish iOS - v10 Xcode salvage
 
 on:
   workflow_dispatch:
@@ -539,7 +539,7 @@ jobs:
           {
             echo "===== MOVED UNITYEDITOR-LEAKING STUBS ====="
             find "$BACKUP" -maxdepth 1 -type f -printf '%f  %s bytes\n' | sort
-          } | tee output/v9-moved-unityeditor-stubs.txt
+          } | tee output/v10-moved-unityeditor-stubs.txt
 
           rm -rf \
             "$PROJECT/Library" \
@@ -558,7 +558,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - "$PROJECT" "$GITHUB_WORKSPACE/output/json-services-stubs-v9" <<'PY'
+          python3 - "$PROJECT" "$GITHUB_WORKSPACE/output/json-services-stubs-v10" <<'PY'
           import json, shutil, sys
           from pathlib import Path
           project, backup = map(Path, sys.argv[1:])
@@ -905,7 +905,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" "$PROJECT" build output \
             2>/dev/null || true
 
-          echo "===== UNITY iOS BUILD v9 - REAL PLAYER LINKER FIX ====="
+          echo "===== UNITY iOS BUILD v10 - KEEP PARTIAL XCODE EXPORT ====="
           echo "Editor: $UNITY_EDITOR"
           echo "Project: $PROJECT"
           echo "Output: $HTF_IOS_XCODE_PATH"
@@ -925,8 +925,18 @@ jobs:
 
           tail -400 "$LOG" || true
           echo "===== ERRORS WITH STACK CONTEXT ====="
-          grep -n -A 30 -B 8 -E 'NullReferenceException|Error building Player|Fatal error|error CS[0-9]+' "$LOG" | tail -260 || true
-          exit "$RC"
+          grep -n -A 30 -B 8 -E 'NullReferenceException|Error building Player|Fatal error|error CS[0-9]+|Unknown file extension' "$LOG" | tail -320 || true
+
+          # Unity sometimes returns non-zero after the iOS Xcode project has
+          # already been generated (for example during late post-processing).
+          # Do not kill the whole workflow here. The next step checks for a
+          # real .xcodeproj/project.pbxproj. If it exists we keep going and
+          # let macOS/xcodebuild tell us whether the export is usable.
+          if [ "$RC" -ne 0 ]; then
+            echo "WARNING: Unity returned $RC; checking whether Xcode export survived."
+          fi
+
+          exit 0
 
       - name: Detect Xcode project
         id: detect_xcode
@@ -984,7 +994,7 @@ jobs:
           cp output/v4-moved-package-stubs.txt \
             unity-build-diagnostics/ 2>/dev/null || true
 
-          cp output/v9-moved-unityeditor-stubs.txt \
+          cp output/v10-moved-unityeditor-stubs.txt \
             unity-build-diagnostics/ 2>/dev/null || true
 
           if [ -f "${{ steps.locate.outputs.project }}/Packages/packages-lock.json" ]; then
@@ -1019,7 +1029,7 @@ jobs:
           echo "===== IMPORTANT BUILD ERRORS ====="
           tail -500 unity-build-diagnostics/important-errors.txt || true
 
-      - name: Pack Xcode project with real IL2CPP sources
+      - name: Pack surviving Xcode project with real IL2CPP sources
         if: steps.detect_xcode.outputs.ready == 'true'
         shell: bash
         run: |
@@ -1047,16 +1057,16 @@ jobs:
 
           # -h dereferences symlinks. This is important because upload-artifact
           # can lose the linked IL2CPP source tree when a raw directory is uploaded.
-          tar -chzf How-to-Fish-iOS-Xcode-v9.tar.gz             -C build/iOS             HowToFish-iOS
+          tar -chzf How-to-Fish-iOS-Xcode-v10.tar.gz             -C build/iOS             HowToFish-iOS
 
-          ls -lh How-to-Fish-iOS-Xcode-v9.tar.gz
+          ls -lh How-to-Fish-iOS-Xcode-v10.tar.gz
 
       - name: Upload packed Xcode project
         if: steps.detect_xcode.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-v9-TAR
-          path: How-to-Fish-iOS-Xcode-v9.tar.gz
+          name: How-to-Fish-iOS-Xcode-v10-TAR
+          path: How-to-Fish-iOS-Xcode-v10.tar.gz
           if-no-files-found: error
           compression-level: 0
 
@@ -1064,7 +1074,7 @@ jobs:
         if: always() && steps.detect_xcode.outputs.ready != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Unity-Diagnostics-v9
+          name: How-to-Fish-iOS-Unity-Diagnostics-v10
           path: unity-build-diagnostics
           if-no-files-found: warn
           compression-level: 0
@@ -1074,7 +1084,7 @@ jobs:
         shell: bash
         run: |
           echo "Unity did not generate an iOS Xcode project."
-          echo "Download: How-to-Fish-iOS-Unity-Diagnostics-v9"
+          echo "Download: How-to-Fish-iOS-Unity-Diagnostics-v10"
           exit 1
 
   make_ipa:
@@ -1088,7 +1098,7 @@ jobs:
       - name: Download packed Unity Xcode project
         uses: actions/download-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-v9-TAR
+          name: How-to-Fish-iOS-Xcode-v10-TAR
           path: packed-xcode
 
       - name: Extract Xcode project
@@ -1340,9 +1350,9 @@ jobs:
             --sequesterRsrc \
             --keepParent \
             Payload \
-            "How-to-Fish-iOS-v9-unsigned.ipa"
+            "How-to-Fish-iOS-v10-unsigned.ipa"
 
-          IPA_SIZE="$(stat -f%z How-to-Fish-iOS-v9-unsigned.ipa)"
+          IPA_SIZE="$(stat -f%z How-to-Fish-iOS-v10-unsigned.ipa)"
 
           if [ "$IPA_SIZE" -lt 10485760 ]; then
             echo "ERROR: IPA is suspiciously small: $IPA_SIZE bytes"
@@ -1350,13 +1360,13 @@ jobs:
           fi
 
           echo "===== Build candidate VERIFIED ====="
-          ls -lh How-to-Fish-iOS-v9-unsigned.ipa
+          ls -lh How-to-Fish-iOS-v10-unsigned.ipa
 
       - name: Upload Build candidate
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-v9-Build-Candidate
-          path: How-to-Fish-iOS-v9-unsigned.ipa
+          name: How-to-Fish-iOS-v10-Build-Candidate
+          path: How-to-Fish-iOS-v10-unsigned.ipa
           if-no-files-found: error
           compression-level: 0
 
@@ -1396,5 +1406,5 @@ jobs:
         if: success()
         shell: bash
         run: |
-          echo "SUCCESS: How-to-Fish-iOS-v9-unsigned.ipa"
-          echo "Artifact: How-to-Fish-iOS-v9-Build-Candidate"
+          echo "SUCCESS: How-to-Fish-iOS-v10-unsigned.ipa"
+          echo "Artifact: How-to-Fish-iOS-v10-Build-Candidate"
