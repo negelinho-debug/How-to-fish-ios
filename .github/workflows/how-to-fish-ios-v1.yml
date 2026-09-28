@@ -1,4 +1,4 @@
-name: How to Fish iOS - v7 REAL IPA
+name: How to Fish iOS - v8 REAL IPA
 
 on:
   workflow_dispatch:
@@ -395,6 +395,8 @@ jobs:
 
           # Unity 6000.4 ships URP/SRP Core/ShaderGraph generation 17.4.
           deps["com.unity.render-pipelines.universal"] = "17.4.0"
+          deps["com.unity.visualeffectgraph"] = "17.4.0"
+          deps["com.unity.purchasing"] = "4.14.0"
 
           path.write_text(
               json.dumps(data, indent=2, ensure_ascii=False) + "\n",
@@ -488,6 +490,59 @@ jobs:
             2>/dev/null || true
 
           echo "v4 fixes duplicate TMPro and Unsafe/Burst/Collections package stubs."
+
+      - name: Remove UnityEditor-leaking AssetRipper stubs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT="${{ steps.locate.outputs.project }}"
+          BACKUP="$GITHUB_WORKSPACE/output/assetripper-unityeditor-stubs-v8"
+          mkdir -p "$BACKUP"
+
+          echo "===== v8 FIX: REMOVE DLL STUBS THAT LEAK UnityEditor INTO PLAYER ====="
+
+          for NAME in \
+            Unity.Scripting.dll \
+            UnityEngine.ScriptingModule.dll \
+            Unity.VisualEffectGraph.Runtime.dll \
+            Purchasing.Common.dll \
+            UnityEngine.Purchasing.dll \
+            UnityEngine.Purchasing.Stores.dll \
+            UnityEngine.Purchasing.Security.dll \
+            UnityEngine.Purchasing.SecurityCore.dll \
+            UnityEngine.Purchasing.AppleCore.dll \
+            UnityEngine.Purchasing.AppleStub.dll \
+            UnityEngine.Purchasing.AppleMacosStub.dll \
+            UnityEngine.Purchasing.WinRTCore.dll \
+            UnityEngine.Purchasing.WinRTStub.dll
+          do
+            FILE="$PROJECT/Assets/Plugins/$NAME"
+            if [ -f "$FILE" ]; then
+              echo "MOVE $FILE -> $BACKUP/$NAME"
+              mv "$FILE" "$BACKUP/$NAME"
+              if [ -f "$FILE.meta" ]; then
+                mv "$FILE.meta" "$BACKUP/$NAME.meta"
+              fi
+            fi
+          done
+
+          {
+            echo "===== MOVED UNITYEDITOR-LEAKING STUBS ====="
+            find "$BACKUP" -maxdepth 1 -type f -printf '%f  %s bytes\n' | sort
+          } | tee output/v8-moved-unityeditor-stubs.txt
+
+          rm -rf \
+            "$PROJECT/Library" \
+            "$PROJECT/Temp" \
+            "$PROJECT/obj" \
+            2>/dev/null || true
+
+          echo
+          echo "Official replacements:"
+          echo "- Unity engine provides Unity.Scripting / ScriptingModule"
+          echo "- com.unity.visualeffectgraph 17.4.0 replaces VFX stub"
+          echo "- com.unity.purchasing 4.14.0 replaces IAP stubs"
 
       - name: Record AssetRipper plugin DLLs
         shell: bash
@@ -796,7 +851,6 @@ jobs:
 
       - name: Build Unity iOS Xcode project
         id: unity_build
-        continue-on-error: true
         shell: bash
         env:
           HTF_IOS_XCODE_PATH: ${{ github.workspace }}/build/iOS/HowToFish-iOS
@@ -812,7 +866,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" "$PROJECT" build output \
             2>/dev/null || true
 
-          echo "===== UNITY iOS BUILD v7 - PRESERVE IL2CPP SOURCES ====="
+          echo "===== UNITY iOS BUILD v8 - REAL PLAYER LINKER FIX ====="
           echo "Editor: $UNITY_EDITOR"
           echo "Project: $PROJECT"
           echo "Output: $HTF_IOS_XCODE_PATH"
@@ -889,6 +943,9 @@ jobs:
           cp output/v4-moved-package-stubs.txt \
             unity-build-diagnostics/ 2>/dev/null || true
 
+          cp output/v8-moved-unityeditor-stubs.txt \
+            unity-build-diagnostics/ 2>/dev/null || true
+
           if [ -f "${{ steps.locate.outputs.project }}/Packages/packages-lock.json" ]; then
             cp "${{ steps.locate.outputs.project }}/Packages/packages-lock.json" \
               unity-build-diagnostics/packages-lock.json 2>/dev/null || true
@@ -913,7 +970,7 @@ jobs:
           } > unity-build-diagnostics/summary.txt
 
           grep -RniE \
-            'error CS[0-9]+|Compilation failed|compiler error|Exception|error:|failed|FAILURE|DllNotFoundException|MissingReferenceException|TypeLoadException|Assertion|SIGABRT|crash|ApiUpdater|MovedFromExtractor|NotImplementedException|NullReferenceException|Package Manager|UPM|render-pipelines|duplicate assembly|Assembly with name' \
+            'error CS[0-9]+|Compilation failed|compiler error|Exception|error:|failed|FAILURE|DllNotFoundException|MissingReferenceException|TypeLoadException|Assertion|SIGABRT|crash|ApiUpdater|MovedFromExtractor|NotImplementedException|NullReferenceException|Package Manager|UPM|render-pipelines|duplicate assembly|Assembly with name|UnityEditor.dll assembly is referenced by user code|Fatal error in Unity CIL Linker|UnityLinker' \
             unity-build-diagnostics \
             > unity-build-diagnostics/important-errors.txt \
             2>/dev/null || true
@@ -950,16 +1007,16 @@ jobs:
 
           # -h dereferences symlinks. This is important because upload-artifact
           # can lose the linked IL2CPP source tree when a raw directory is uploaded.
-          tar -chzf How-to-Fish-iOS-Xcode-v7.tar.gz             -C build/iOS             HowToFish-iOS
+          tar -chzf How-to-Fish-iOS-Xcode-v8.tar.gz             -C build/iOS             HowToFish-iOS
 
-          ls -lh How-to-Fish-iOS-Xcode-v7.tar.gz
+          ls -lh How-to-Fish-iOS-Xcode-v8.tar.gz
 
       - name: Upload packed Xcode project
         if: steps.detect_xcode.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-v7-TAR
-          path: How-to-Fish-iOS-Xcode-v7.tar.gz
+          name: How-to-Fish-iOS-Xcode-v8-TAR
+          path: How-to-Fish-iOS-Xcode-v8.tar.gz
           if-no-files-found: error
           compression-level: 0
 
@@ -967,7 +1024,7 @@ jobs:
         if: always() && steps.detect_xcode.outputs.ready != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Unity-Diagnostics-v7
+          name: How-to-Fish-iOS-Unity-Diagnostics-v8
           path: unity-build-diagnostics
           if-no-files-found: warn
           compression-level: 0
@@ -977,7 +1034,7 @@ jobs:
         shell: bash
         run: |
           echo "Unity did not generate an iOS Xcode project."
-          echo "Download: How-to-Fish-iOS-Unity-Diagnostics-v7"
+          echo "Download: How-to-Fish-iOS-Unity-Diagnostics-v8"
           exit 1
 
   make_ipa:
@@ -991,7 +1048,7 @@ jobs:
       - name: Download packed Unity Xcode project
         uses: actions/download-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-v7-TAR
+          name: How-to-Fish-iOS-Xcode-v8-TAR
           path: packed-xcode
 
       - name: Extract Xcode project
@@ -1243,9 +1300,9 @@ jobs:
             --sequesterRsrc \
             --keepParent \
             Payload \
-            "How-to-Fish-iOS-v7-unsigned.ipa"
+            "How-to-Fish-iOS-v8-unsigned.ipa"
 
-          IPA_SIZE="$(stat -f%z How-to-Fish-iOS-v7-unsigned.ipa)"
+          IPA_SIZE="$(stat -f%z How-to-Fish-iOS-v8-unsigned.ipa)"
 
           if [ "$IPA_SIZE" -lt 10485760 ]; then
             echo "ERROR: IPA is suspiciously small: $IPA_SIZE bytes"
@@ -1253,13 +1310,13 @@ jobs:
           fi
 
           echo "===== REAL IPA VERIFIED ====="
-          ls -lh How-to-Fish-iOS-v7-unsigned.ipa
+          ls -lh How-to-Fish-iOS-v8-unsigned.ipa
 
       - name: Upload REAL IPA
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-v7-REAL-IPA
-          path: How-to-Fish-iOS-v7-unsigned.ipa
+          name: How-to-Fish-iOS-v8-REAL-IPA
+          path: How-to-Fish-iOS-v8-unsigned.ipa
           if-no-files-found: error
           compression-level: 0
 
@@ -1290,7 +1347,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-Diagnostics-v7
+          name: How-to-Fish-iOS-Xcode-Diagnostics-v8
           path: xcode-diagnostics
           if-no-files-found: warn
           compression-level: 0
@@ -1299,5 +1356,5 @@ jobs:
         if: success()
         shell: bash
         run: |
-          echo "SUCCESS: How-to-Fish-iOS-v7-unsigned.ipa"
-          echo "Artifact: How-to-Fish-iOS-v7-REAL-IPA"
+          echo "SUCCESS: How-to-Fish-iOS-v8-unsigned.ipa"
+          echo "Artifact: How-to-Fish-iOS-v8-REAL-IPA"
