@@ -1,4 +1,5 @@
-name: How to Fish iOS - v8 REAL IPA
+# v9: targeted JSON/Services build fix. Not a verified playable or offline port.
+name: How to Fish iOS - v9 Build candidate
 
 on:
   workflow_dispatch:
@@ -136,7 +137,7 @@ jobs:
             | tee output/csharp-count.txt
 
           echo "===== NATIVE/ONLINE REFERENCES ====="
-          grep -RniE \
+          grep -RniE -A 25 -B 5 \
             'GoogleMobileAds|AndroidJava|UNITY_ANDROID|Epic\.OnlineServices|EOS|Steamworks|FishNet' \
             "$PROJECT/Assets" \
             --include='*.cs' \
@@ -249,6 +250,14 @@ jobs:
           {
               public static void PerformBuild()
               {
+                  // Fail before export if a recovered JSON stub still shadows the package.
+                  string jsonProbe = Newtonsoft.Json.JsonConvert.SerializeObject(
+                      new Dictionary<string, int> { { "probe", 9 } });
+                  var probe = Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, int>>(jsonProbe);
+                  if (probe == null || !probe.ContainsKey("probe") || probe["probe"] != 9)
+                      throw new Exception("Newtonsoft JSON round-trip failed; check recovered DLLs.");
+                  Debug.Log("Newtonsoft JSON round-trip passed.");
+
                   string preferredMain = "Assets/Scenes/Game.unity";
 
                   List<string> scenes = AssetDatabase
@@ -497,10 +506,10 @@ jobs:
           set -euo pipefail
 
           PROJECT="${{ steps.locate.outputs.project }}"
-          BACKUP="$GITHUB_WORKSPACE/output/assetripper-unityeditor-stubs-v8"
+          BACKUP="$GITHUB_WORKSPACE/output/assetripper-unityeditor-stubs-v9"
           mkdir -p "$BACKUP"
 
-          echo "===== v8 FIX: REMOVE DLL STUBS THAT LEAK UnityEditor INTO PLAYER ====="
+          echo "===== v9 FIX: REMOVE DLL STUBS THAT LEAK UnityEditor INTO PLAYER ====="
 
           for NAME in \
             Unity.Scripting.dll \
@@ -530,7 +539,7 @@ jobs:
           {
             echo "===== MOVED UNITYEDITOR-LEAKING STUBS ====="
             find "$BACKUP" -maxdepth 1 -type f -printf '%f  %s bytes\n' | sort
-          } | tee output/v8-moved-unityeditor-stubs.txt
+          } | tee output/v9-moved-unityeditor-stubs.txt
 
           rm -rf \
             "$PROJECT/Library" \
@@ -543,6 +552,36 @@ jobs:
           echo "- Unity engine provides Unity.Scripting / ScriptingModule"
           echo "- com.unity.visualeffectgraph 17.4.0 replaces VFX stub"
           echo "- com.unity.purchasing 4.14.0 replaces IAP stubs"
+
+
+      - name: Replace recovered JSON and Unity Services Core DLLs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$PROJECT" "$GITHUB_WORKSPACE/output/json-services-stubs-v9" <<'PY'
+          import json, shutil, sys
+          from pathlib import Path
+          project, backup = map(Path, sys.argv[1:])
+          backup.mkdir(parents=True, exist_ok=True)
+          manifest = project / "Packages/manifest.json"
+          data = json.loads(manifest.read_text())
+          deps = data.setdefault("dependencies", {})
+          deps["com.unity.nuget.newtonsoft-json"] = "3.2.1"
+          deps["com.unity.services.core"] = "1.12.5"
+          manifest.write_text(json.dumps(data, indent=2) + "\n")
+          for dll in sorted((project / "Assets").rglob("*.dll")):
+              name = dll.name
+              if name != "Newtonsoft.Json.dll" and name != "Unity.Services.Core.dll" and not name.startswith("Unity.Services.Core."):
+                  continue
+              target = backup / dll.relative_to(project / "Assets")
+              target.parent.mkdir(parents=True, exist_ok=True)
+              print("Replace recovered DLL with official package:", dll.relative_to(project))
+              shutil.move(str(dll), str(target))
+              meta = Path(str(dll) + ".meta")
+              if meta.exists():
+                  shutil.move(str(meta), str(target) + ".meta")
+          (project / "Packages/packages-lock.json").unlink(missing_ok=True)
+          PY
 
       - name: Record AssetRipper plugin DLLs
         shell: bash
@@ -866,7 +905,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" "$PROJECT" build output \
             2>/dev/null || true
 
-          echo "===== UNITY iOS BUILD v8 - REAL PLAYER LINKER FIX ====="
+          echo "===== UNITY iOS BUILD v9 - REAL PLAYER LINKER FIX ====="
           echo "Editor: $UNITY_EDITOR"
           echo "Project: $PROJECT"
           echo "Output: $HTF_IOS_XCODE_PATH"
@@ -885,6 +924,8 @@ jobs:
           echo "UNITY_EXIT_CODE=$RC" | tee output/unity-exit-code.txt
 
           tail -400 "$LOG" || true
+          echo "===== ERRORS WITH STACK CONTEXT ====="
+          grep -n -A 30 -B 8 -E 'NullReferenceException|Error building Player|Fatal error|error CS[0-9]+' "$LOG" | tail -260 || true
           exit "$RC"
 
       - name: Detect Xcode project
@@ -943,7 +984,7 @@ jobs:
           cp output/v4-moved-package-stubs.txt \
             unity-build-diagnostics/ 2>/dev/null || true
 
-          cp output/v8-moved-unityeditor-stubs.txt \
+          cp output/v9-moved-unityeditor-stubs.txt \
             unity-build-diagnostics/ 2>/dev/null || true
 
           if [ -f "${{ steps.locate.outputs.project }}/Packages/packages-lock.json" ]; then
@@ -997,7 +1038,6 @@ jobs:
           )"
 
           echo "IL2CPP_CPP_COUNT=$CPP_COUNT"
-
           if [ "$CPP_COUNT" -lt 2 ]; then
             echo "ERROR: Unity export does not contain real IL2CPP game sources."
             echo "Refusing to make another fake/black-screen IPA."
@@ -1007,16 +1047,16 @@ jobs:
 
           # -h dereferences symlinks. This is important because upload-artifact
           # can lose the linked IL2CPP source tree when a raw directory is uploaded.
-          tar -chzf How-to-Fish-iOS-Xcode-v8.tar.gz             -C build/iOS             HowToFish-iOS
+          tar -chzf How-to-Fish-iOS-Xcode-v9.tar.gz             -C build/iOS             HowToFish-iOS
 
-          ls -lh How-to-Fish-iOS-Xcode-v8.tar.gz
+          ls -lh How-to-Fish-iOS-Xcode-v9.tar.gz
 
       - name: Upload packed Xcode project
         if: steps.detect_xcode.outputs.ready == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-v8-TAR
-          path: How-to-Fish-iOS-Xcode-v8.tar.gz
+          name: How-to-Fish-iOS-Xcode-v9-TAR
+          path: How-to-Fish-iOS-Xcode-v9.tar.gz
           if-no-files-found: error
           compression-level: 0
 
@@ -1024,7 +1064,7 @@ jobs:
         if: always() && steps.detect_xcode.outputs.ready != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Unity-Diagnostics-v8
+          name: How-to-Fish-iOS-Unity-Diagnostics-v9
           path: unity-build-diagnostics
           if-no-files-found: warn
           compression-level: 0
@@ -1034,7 +1074,7 @@ jobs:
         shell: bash
         run: |
           echo "Unity did not generate an iOS Xcode project."
-          echo "Download: How-to-Fish-iOS-Unity-Diagnostics-v8"
+          echo "Download: How-to-Fish-iOS-Unity-Diagnostics-v9"
           exit 1
 
   make_ipa:
@@ -1048,7 +1088,7 @@ jobs:
       - name: Download packed Unity Xcode project
         uses: actions/download-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-v8-TAR
+          name: How-to-Fish-iOS-Xcode-v9-TAR
           path: packed-xcode
 
       - name: Extract Xcode project
@@ -1300,23 +1340,23 @@ jobs:
             --sequesterRsrc \
             --keepParent \
             Payload \
-            "How-to-Fish-iOS-v8-unsigned.ipa"
+            "How-to-Fish-iOS-v9-unsigned.ipa"
 
-          IPA_SIZE="$(stat -f%z How-to-Fish-iOS-v8-unsigned.ipa)"
+          IPA_SIZE="$(stat -f%z How-to-Fish-iOS-v9-unsigned.ipa)"
 
           if [ "$IPA_SIZE" -lt 10485760 ]; then
             echo "ERROR: IPA is suspiciously small: $IPA_SIZE bytes"
             exit 1
           fi
 
-          echo "===== REAL IPA VERIFIED ====="
-          ls -lh How-to-Fish-iOS-v8-unsigned.ipa
+          echo "===== Build candidate VERIFIED ====="
+          ls -lh How-to-Fish-iOS-v9-unsigned.ipa
 
-      - name: Upload REAL IPA
+      - name: Upload Build candidate
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-v8-REAL-IPA
-          path: How-to-Fish-iOS-v8-unsigned.ipa
+          name: How-to-Fish-iOS-v9-Build-Candidate
+          path: How-to-Fish-iOS-v9-unsigned.ipa
           if-no-files-found: error
           compression-level: 0
 
@@ -1347,7 +1387,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: How-to-Fish-iOS-Xcode-Diagnostics-v8
+          name: How-to-Fish-iOS-Xcode-Diagnostics-v9
           path: xcode-diagnostics
           if-no-files-found: warn
           compression-level: 0
@@ -1356,5 +1396,5 @@ jobs:
         if: success()
         shell: bash
         run: |
-          echo "SUCCESS: How-to-Fish-iOS-v8-unsigned.ipa"
-          echo "Artifact: How-to-Fish-iOS-v8-REAL-IPA"
+          echo "SUCCESS: How-to-Fish-iOS-v9-unsigned.ipa"
+          echo "Artifact: How-to-Fish-iOS-v9-Build-Candidate"
